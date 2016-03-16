@@ -1067,7 +1067,7 @@ int main(void) {
     src_ip[3]= last_ip_byte; 
     create_arp_req(client_mac,bssid_mac,bssid_mac,src_ip,dst_ip,context,0x01);
     unsigned int sport_1=rand()%60000+1024;
-    u8 server_ip[4]= "\x84\xAA\xD9\x03"; 
+    u8 server_ip[4]= "\xXXX\xXX\xXX\xXX"; 
     u8 server_mac[6] = "\x6c\x72\x20\x3e\xb0\x34"; 
     create_tcp_3way(client_mac,bssid_mac,bssid_mac,src_ip,server_ip,sport_1,80,context,0x01);
 	printf ("\n\t Press anykey to switch to AP2");
@@ -1082,7 +1082,7 @@ int main(void) {
     u8  bssid_mac_2[6] = "\x30\x5a\x3a\xc3\x57\x70";
     u8 src_ip_2[4]= "\xC0\xA8\x01\x03"; 
     u8 gw_ip_2[4]= "\xC0\xA8\x01\x01"; 
-    u8 dst_ip_2[4]= "\x84\xAA\xD9\x03";
+    u8 dst_ip_2[4]= "\xXX\xXX\xXX\xXX";
     frame_seq= 2 ;
     rx_tcp_seq[3]=0;
     tx_tcp_seq[3]=0;
